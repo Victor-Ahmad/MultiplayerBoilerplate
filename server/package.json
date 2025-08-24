@@ -1,0 +1,25 @@
+{
+  "name": "arena-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p .",
+    "start:prod": "node dist/index.js"
+  },
+  "dependencies": {
+    "@colyseus/core": "*",
+    "@colyseus/schema": "*",
+    "@colyseus/ws-transport": "*",
+    "cors": "*",
+    "express": "*"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.3.0",
+    "tsx": "*",
+    "typescript": "*"
+  }
+}

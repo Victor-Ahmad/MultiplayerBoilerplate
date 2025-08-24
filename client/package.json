@@ -1,0 +1,19 @@
+{
+  "name": "arena-client",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && node scripts/postbuild.js",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "colyseus.js": "*",
+    "phaser": "*"
+  },
+  "devDependencies": {
+    "typescript": "*",
+    "vite": "*"
+  }
+}
