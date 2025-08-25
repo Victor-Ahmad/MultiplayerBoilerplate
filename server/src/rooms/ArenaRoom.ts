@@ -1,57 +1,70 @@
 import { type Client, Room } from "@colyseus/core";
 import { ArenaState, Player } from "./schema/State.js";
 
-type InputMessage = {
-  up?: boolean;
-  down?: boolean;
-  left?: boolean;
-  right?: boolean;
+type InputState = {
+  up: boolean;
+  down: boolean;
+  left: boolean;
+  right: boolean;
 };
+
+type InputMessage = Partial<InputState>;
 
 export class ArenaRoom extends Room<ArenaState> {
   maxClients = 20;
 
-  // 30 Hz simulation (unchanged), 20 Hz patch stream to clients
+  /** Simulation tick (authoritative). */
   readonly TICK_MS = 1000 / 30;
-  readonly PATCH_RATE_MS = 1000 / 20;
+
+  /** Simple cooldown to avoid message spam for toggling patrol. */
+  readonly TOGGLE_COOLDOWN_MS = 250;
+
+  /** Per-client current input snapshot (zero-trust: server decides). */
+  private inputs = new Map<string, InputState>();
+
+  /** Per-client last time they toggled patrol (ms since epoch). */
+  private lastToggleAt = new Map<string, number>();
 
   onCreate(_options: any) {
     this.setState(new ArenaState());
 
-    // NEW: send state patches at 20 Hz
-    this.setPatchRate(this.PATCH_RATE_MS);
+    // Send state patches ~20 Hz (bandwidth friendly).
+    this.setPatchRate(20);
 
-    // Handle player input (authoritative)
+    // Store current input snapshot per client (no movement here!)
     this.onMessage("input", (client, data: InputMessage) => {
-      const p = this.state.players.get(client.sessionId);
-      if (!p) return;
+      const next: InputState = {
+        up: !!data.up,
+        down: !!data.down,
+        left: !!data.left,
+        right: !!data.right,
+      };
 
-      if (data.up || data.down || data.left || data.right) p.patrol = false;
+      // If you ever switch to key-down/up deltas, adapt this merge logic accordingly.
+      this.inputs.set(client.sessionId, next);
 
-      const step = p.speed * (this.TICK_MS / 1000);
-      let dx = 0,
-        dy = 0;
-      if (data.up) dy -= step;
-      if (data.down) dy += step;
-      if (data.left) dx -= step;
-      if (data.right) dx += step;
-
-      if (dx !== 0 || dy !== 0) {
-        // NEW: quantize to 2 decimals before writing to schema
-        p.x = q2(clamp(p.x + dx, 0, this.state.width));
-        p.y = q2(clamp(p.y + dy, 0, this.state.height));
-        p.angle = Math.atan2(dy, dx);
+      // Any manual input cancels patrol
+      if (next.up || next.down || next.left || next.right) {
+        const p = this.state.players.get(client.sessionId);
+        if (p) p.patrol = false;
       }
     });
 
+    // Toggle patrol mode (with tiny cooldown)
     this.onMessage("togglePatrol", (client) => {
+      const now = Date.now();
+      const last = this.lastToggleAt.get(client.sessionId) ?? 0;
+      if (now - last < this.TOGGLE_COOLDOWN_MS) return;
+      this.lastToggleAt.set(client.sessionId, now);
+
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
+
       p.patrol = !p.patrol;
       if (p.patrol) this.assignNewWaypoint(p);
     });
 
-    // Fixed tick simulation loop (patrol AI)
+    // Single authoritative fixed-tick for everyone (players + AI)
     this.clock.setInterval(() => this.simulate(), this.TICK_MS);
   }
 
@@ -60,36 +73,85 @@ export class ArenaRoom extends Room<ArenaState> {
     p.x = Math.random() * this.state.width;
     p.y = Math.random() * this.state.height;
     p.color = randomColor();
-    this.state.players.set(client.sessionId, p);
 
+    this.state.players.set(client.sessionId, p);
+    this.inputs.set(client.sessionId, {
+      up: false,
+      down: false,
+      left: false,
+      right: false,
+    });
+    this.lastToggleAt.set(client.sessionId, 0);
+
+    // Tell the client their id (used by the frontend to set camera, prediction, etc.)
     client.send("you", { id: client.sessionId });
   }
 
   onLeave(client: Client) {
     this.state.players.delete(client.sessionId);
+    this.inputs.delete(client.sessionId);
+    this.lastToggleAt.delete(client.sessionId);
   }
 
+  /** Authoritative simulation step (30 Hz). */
   private simulate() {
     const dt = this.TICK_MS / 1000;
-    this.state.players.forEach((p) => {
-      if (!p.patrol) return;
-      const dx = p.tx - p.x;
-      const dy = p.ty - p.y;
-      const dist = Math.hypot(dx, dy);
-      if (dist < 5) {
-        this.assignNewWaypoint(p);
+
+    this.state.players.forEach((p: Player, id: string) => {
+      const input = this.inputs.get(id) ?? {
+        up: false,
+        down: false,
+        left: false,
+        right: false,
+      };
+
+      // If patrol is active AND there is no manual input, run patrol AI
+      if (p.patrol && !(input.up || input.down || input.left || input.right)) {
+        const dx = p.tx - p.x;
+        const dy = p.ty - p.y;
+        const dist = Math.hypot(dx, dy);
+
+        if (dist < 5) {
+          this.assignNewWaypoint(p);
+          return;
+        }
+
+        const vx = (dx / (dist || 1)) * p.speed;
+        const vy = (dy / (dist || 1)) * p.speed;
+
+        p.x = clamp(p.x + vx * dt, 0, this.state.width);
+        p.y = clamp(p.y + vy * dt, 0, this.state.height);
+        p.angle = Math.atan2(vy, vx);
         return;
       }
-      const vx = (dx / dist) * p.speed;
-      const vy = (dy / dist) * p.speed;
 
-      // NEW: quantize here too
-      p.x = q2(clamp(p.x + vx * dt, 0, this.state.width));
-      p.y = q2(clamp(p.y + vy * dt, 0, this.state.height));
-      p.angle = Math.atan2(vy, vx);
+      // Otherwise, authoritative movement from input snapshot
+      let ix = 0;
+      let iy = 0;
+      if (input.up) iy -= 1;
+      if (input.down) iy += 1;
+      if (input.left) ix -= 1;
+      if (input.right) ix += 1;
+
+      if (ix !== 0 || iy !== 0) {
+        // Normalize diagonal
+        if (ix !== 0 && iy !== 0) {
+          const inv = 1 / Math.sqrt(2);
+          ix *= inv;
+          iy *= inv;
+        }
+
+        const vx = ix * p.speed;
+        const vy = iy * p.speed;
+
+        p.x = clamp(p.x + vx * dt, 0, this.state.width);
+        p.y = clamp(p.y + vy * dt, 0, this.state.height);
+        p.angle = Math.atan2(vy, vx);
+      }
     });
   }
 
+  /** Pick a fresh patrol waypoint inside the arena with a small margin. */
   private assignNewWaypoint(p: Player) {
     const margin = 50;
     p.tx = margin + Math.random() * (this.state.width - margin * 2);
@@ -97,13 +159,9 @@ export class ArenaRoom extends Room<ArenaState> {
   }
 }
 
+/** Inclusive clamp. */
 function clamp(v: number, min: number, max: number) {
   return Math.max(min, Math.min(max, v));
-}
-
-// NEW: 2-decimal quantizer
-function q2(n: number) {
-  return Math.round(n * 100) / 100;
 }
 
 function randomColor() {
