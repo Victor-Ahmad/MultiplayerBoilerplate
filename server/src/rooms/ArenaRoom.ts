@@ -8,7 +8,9 @@ type InputState = {
   right: boolean;
 };
 
-type InputMessage = Partial<InputState>;
+type InputMessage = Partial<InputState> & { seq?: number };
+
+const MAX_INPUTS_PER_SEC = 60;
 
 export class ArenaRoom extends Room<ArenaState> {
   maxClients = 20;
@@ -25,6 +27,9 @@ export class ArenaRoom extends Room<ArenaState> {
   /** Per-client last time they toggled patrol (ms since epoch). */
   private lastToggleAt = new Map<string, number>();
 
+  /** Per-client token bucket to rate-limit input messages. */
+  private inputBudget = new Map<string, { tokens: number; last: number }>();
+
   onCreate(_options: any) {
     this.setState(new ArenaState());
 
@@ -33,20 +38,34 @@ export class ArenaRoom extends Room<ArenaState> {
 
     // Store current input snapshot per client (no movement here!)
     this.onMessage("input", (client, data: InputMessage) => {
+      // --- rate limit via token bucket ---
+      const bucket = this.inputBudget.get(client.sessionId);
+      if (!bucket) return;
+      const now = Date.now();
+      const refill = ((now - bucket.last) / 1000) * MAX_INPUTS_PER_SEC;
+      bucket.tokens = Math.min(MAX_INPUTS_PER_SEC, bucket.tokens + refill);
+      bucket.last = now;
+      if (bucket.tokens < 1) return; // drop if out of tokens
+      bucket.tokens -= 1;
+
+      // --- merge input snapshot ---
       const next: InputState = {
         up: !!data.up,
         down: !!data.down,
         left: !!data.left,
         right: !!data.right,
       };
-
-      // If you ever switch to key-down/up deltas, adapt this merge logic accordingly.
       this.inputs.set(client.sessionId, next);
 
+      // record last processed input seq for reconciliation
+      const p = this.state.players.get(client.sessionId);
+      if (p && typeof data.seq === "number") {
+        p.lastProcessedInput = data.seq;
+      }
+
       // Any manual input cancels patrol
-      if (next.up || next.down || next.left || next.right) {
-        const p = this.state.players.get(client.sessionId);
-        if (p) p.patrol = false;
+      if (p && (next.up || next.down || next.left || next.right)) {
+        p.patrol = false;
       }
     });
 
@@ -82,6 +101,10 @@ export class ArenaRoom extends Room<ArenaState> {
       right: false,
     });
     this.lastToggleAt.set(client.sessionId, 0);
+    this.inputBudget.set(client.sessionId, {
+      tokens: MAX_INPUTS_PER_SEC,
+      last: Date.now(),
+    });
 
     // Tell the client their id (used by the frontend to set camera, prediction, etc.)
     client.send("you", { id: client.sessionId });
@@ -91,6 +114,7 @@ export class ArenaRoom extends Room<ArenaState> {
     this.state.players.delete(client.sessionId);
     this.inputs.delete(client.sessionId);
     this.lastToggleAt.delete(client.sessionId);
+    this.inputBudget.delete(client.sessionId);
   }
 
   /** Authoritative simulation step (30 Hz). */
@@ -121,7 +145,10 @@ export class ArenaRoom extends Room<ArenaState> {
 
         p.x = clamp(p.x + vx * dt, 0, this.state.width);
         p.y = clamp(p.y + vy * dt, 0, this.state.height);
-        p.angle = Math.atan2(vy, vx);
+
+        const ang = Math.atan2(vy, vx);
+        if (Number.isFinite(ang)) p.angle = ang;
+
         return;
       }
 
@@ -146,7 +173,9 @@ export class ArenaRoom extends Room<ArenaState> {
 
         p.x = clamp(p.x + vx * dt, 0, this.state.width);
         p.y = clamp(p.y + vy * dt, 0, this.state.height);
-        p.angle = Math.atan2(vy, vx);
+
+        const ang = Math.atan2(vy, vx);
+        if (Number.isFinite(ang)) p.angle = ang;
       }
     });
   }

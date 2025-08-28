@@ -10,6 +10,7 @@ type PlayerSchema = {
   tx: number;
   ty: number;
   speed: number;
+  lastProcessedInput?: number;
 };
 
 export default class GameScene extends Phaser.Scene {
@@ -27,41 +28,36 @@ export default class GameScene extends Phaser.Scene {
   private sprites = new Map<string, Phaser.GameObjects.Arc>();
   private labels = new Map<string, Phaser.GameObjects.Text>();
 
-  // ⬇️ Local prediction state for *me*
+  // Local prediction state for *me*
   private myPred = { x: 0, y: 0 };
-  private myServerRef?: PlayerSchema;
+
+  // reconciliation buffers
+  private seq = 0;
+  private pending: Array<{
+    seq: number;
+    up: boolean;
+    down: boolean;
+    left: boolean;
+    right: boolean;
+    dt: number; // ms at time of send
+  }> = [];
 
   private lastSent = 0;
   private world = { w: 2000, h: 2000 };
 
-  private fitCameraToScreen() {
-    const w = this.scale.width;
-    const h = this.scale.height;
-
-    // Make the main camera fill the canvas
-    this.cameras.main.setViewport(0, 0, w, h);
-    this.cameras.main.setSize(w, h); // redundant but explicit
-    this.cameras.resize(w, h); // ensure all cameras match size
-
-    // Make sure zoom didn’t get changed somewhere
-    this.cameras.main.setZoom(1);
-
-    // Keep world bounds (so follow & scrolling still behave)
-    this.cameras.main.setBounds(0, 0, this.world.w, this.world.h);
-  }
   private fitCameraToCanvas() {
     const w = this.scale.width;
     const h = this.scale.height;
     const cam = this.cameras.main;
 
-    // fill the canvas, always
-    this.cameras.resize(w, h); // resize all cameras to canvas
-    cam.setViewport(0, 0, w, h); // explicit viewport === canvas
-    cam.setSize(w, h); // redundant but explicit
+    this.cameras.resize(w, h);
+    cam.setViewport(0, 0, w, h);
+    cam.setSize(w, h);
     cam.setZoom(1);
     cam.setBounds(0, 0, this.world.w, this.world.h);
-    cam.setRoundPixels(true); // reduces subpixel jitter
+    cam.setRoundPixels(true);
   }
+
   create() {
     const endpoint = import.meta.env.DEV
       ? "ws://localhost:2567"
@@ -77,9 +73,7 @@ export default class GameScene extends Phaser.Scene {
     this.keyP = this.input.keyboard!.addKey("P");
 
     this.addGrid();
-    this.scale.on("resize", (size: Phaser.Structs.Size) => {
-      this.fitCameraToCanvas();
-    });
+    this.scale.on("resize", () => this.fitCameraToCanvas());
     this.join();
   }
 
@@ -87,109 +81,169 @@ export default class GameScene extends Phaser.Scene {
     this.room = await this.client.joinOrCreate("arena");
     this.room.onMessage("you", (m) => (this.meId = m.id));
 
-    const $ = getStateCallbacks(this.room);
+    // 1) Wait for first full state
+    this.room.onStateChange.once((state: any) => {
+      // sync arena bounds
+      this.world.w = state.width || 2000;
+      this.world.h = state.height || 2000;
 
-    // Arena size (synced from server)
-    this.world.w = (this.room.state as any).width || 2000;
-    this.world.h = (this.room.state as any).height || 2000;
+      // 2) Attach listeners via getStateCallbacks (portable & reliable)
+      const $ = getStateCallbacks(this.room);
 
-    // Players: added
-    $(this.room.state).players.onAdd((p: PlayerSchema, id: string) => {
-      const arc = this.add.circle(p.x, p.y, 14, 0xffffff);
-      arc.setStrokeStyle(2, 0xffffff, 0.5);
-      arc.setFillStyle(Phaser.Display.Color.HexStringToColor(p.color).color);
+      $(this.room.state).players.onAdd((p: PlayerSchema, id: string) => {
+        this.handlePlayerAdd(p, id);
+      });
 
-      const label = this.add
-        .text(p.x, p.y - 24, id.slice(0, 4), {
-          fontSize: "12px",
-          color: "#cde6ff",
-        })
-        .setOrigin(0.5);
+      $(this.room.state).players.onRemove((_p: PlayerSchema, id: string) => {
+        this.handlePlayerRemove(id);
+      });
 
-      this.sprites.set(id, arc);
-      this.labels.set(id, label);
+      $(this.room.state).players.onChange((p: PlayerSchema, id: string) => {
+        this.handlePlayerChange(p, id);
+      });
 
-      if (id === this.room.sessionId) {
-        // Start camera on me
-        this.cameras.main.startFollow(arc, true, 0.1, 0.1);
-        this.fitCameraToCanvas();
-        this.cameras.main.setBounds(0, 0, this.world.w, this.world.h);
+      // 3) Render any players already present at this moment
+      (this.room.state as any).players.forEach(
+        (p: PlayerSchema, id: string) => {
+          this.handlePlayerAdd(p, id);
+        }
+      );
 
-        // Init local prediction from authoritative spawn
-        this.myPred.x = p.x;
-        this.myPred.y = p.y;
-        this.myServerRef = p;
-        this.cameras.main.startFollow(arc, true, 0.1, 0.1);
-        this.fitCameraToScreen();
-      }
-    });
-
-    // Players: removed
-    $(this.room.state).players.onRemove((_p: PlayerSchema, id: string) => {
-      this.sprites.get(id)?.destroy();
-      this.labels.get(id)?.destroy();
-      this.sprites.delete(id);
-      this.labels.delete(id);
+      // Start main loop now that state exists
+      this.events.on(Phaser.Scenes.Events.UPDATE, this.updateLoop, this);
     });
 
     // Toggle patrol
     this.keyP.on("down", () => this.room.send("togglePatrol"));
-
-    // Per-frame loop (get delta)
-    this.events.on(Phaser.Scenes.Events.UPDATE, this.updateLoop, this);
   }
 
-  private updateLoop(_time: number, delta: number) {
-    // --- 1) Send input (throttled ~30/s) ---
-    if (_time - this.lastSent > 33) {
-      const up = this.keyW.isDown || this.cursors.up?.isDown;
-      const down = this.keyS.isDown || this.cursors.down?.isDown;
-      const left = this.keyA.isDown || this.cursors.left?.isDown;
-      const right = this.keyD.isDown || this.cursors.right?.isDown;
-      this.room?.send("input", { up, down, left, right });
-      this.lastSent = _time;
+  private handlePlayerAdd(p: PlayerSchema, id: string) {
+    if (this.sprites.has(id)) return;
+
+    const arc = this.add.circle(p.x, p.y, 14, 0xffffff);
+    arc.setStrokeStyle(2, 0xffffff, 0.5);
+    arc.setFillStyle(Phaser.Display.Color.HexStringToColor(p.color).color);
+
+    const label = this.add
+      .text(p.x, p.y - 24, id.slice(0, 4), {
+        fontSize: "12px",
+        color: "#cde6ff",
+      })
+      .setOrigin(0.5);
+
+    this.sprites.set(id, arc);
+    this.labels.set(id, label);
+
+    if (id === this.room.sessionId) {
+      this.cameras.main.startFollow(arc, true, 0.1, 0.1);
+      this.fitCameraToCanvas();
+      this.cameras.main.setBounds(0, 0, this.world.w, this.world.h);
+
+      // init prediction from server spawn
+      this.myPred.x = p.x;
+      this.myPred.y = p.y;
+    }
+  }
+
+  private handlePlayerRemove(id: string) {
+    this.sprites.get(id)?.destroy();
+    this.labels.get(id)?.destroy();
+    this.sprites.delete(id);
+    this.labels.delete(id);
+  }
+
+  private handlePlayerChange(p: PlayerSchema, id: string) {
+    // reconciliation for *my* player
+    if (id === this.meId) {
+      this.myPred.x = p.x;
+      this.myPred.y = p.y;
+
+      const last = p.lastProcessedInput || 0;
+      this.pending = this.pending.filter((i) => i.seq > last);
+
+      const speed = p.speed ?? 180;
+      for (const i of this.pending) {
+        let dx = 0,
+          dy = 0;
+        if (i.up) dy -= 1;
+        if (i.down) dy += 1;
+        if (i.left) dx -= 1;
+        if (i.right) dx += 1;
+        if (dx && dy) {
+          const inv = 1 / Math.sqrt(2);
+          dx *= inv;
+          dy *= inv;
+        }
+        const dt = Math.min(i.dt, 50) / 1000;
+        this.myPred.x = clamp(this.myPred.x + dx * speed * dt, 0, this.world.w);
+        this.myPred.y = clamp(this.myPred.y + dy * speed * dt, 0, this.world.h);
+      }
+
+      const me = this.sprites.get(this.meId!);
+      if (me) {
+        me.x = this.myPred.x;
+        me.y = this.myPred.y;
+        me.setRotation(p.angle);
+      }
+      this.labels
+        .get(this.meId!)
+        ?.setPosition(this.myPred.x, this.myPred.y - 24);
+    }
+  }
+
+  private updateLoop(time: number, delta: number) {
+    if (!this.room || !(this.room.state as any)?.players) return;
+
+    // 1) gather inputs
+    const up = this.keyW.isDown || this.cursors.up?.isDown || false;
+    const down = this.keyS.isDown || this.cursors.down?.isDown || false;
+    const left = this.keyA.isDown || this.cursors.left?.isDown || false;
+    const right = this.keyD.isDown || this.cursors.right?.isDown || false;
+
+    // 2) send at ~30/s + record for reconciliation
+    if (time - this.lastSent > 33) {
+      const msg = { seq: ++this.seq, up, down, left, right };
+      this.room.send("input", msg);
+      this.pending.push({ ...msg, dt: Math.min(delta, 50) });
+      if (this.pending.length > 256)
+        this.pending.splice(0, this.pending.length - 256);
+      this.lastSent = time;
     }
 
-    // --- 2) Predict my own movement at render-rate ---
+    // 3) predict me every frame
     const meSprite = this.meId ? this.sprites.get(this.meId) : undefined;
-    const p = this.myServerRef;
+    const serverMe = this.meId
+      ? ((this.room.state as any).players.get(this.meId) as
+          | PlayerSchema
+          | undefined)
+      : undefined;
 
-    if (meSprite && p) {
-      const dt = Math.min(delta, 50) / 1000; // clamp big spikes
-      const speed = p.speed ?? 180;
+    if (meSprite && serverMe) {
+      const dt = Math.min(delta, 50) / 1000;
+      const speed = serverMe.speed ?? 180;
 
-      const up = this.keyW.isDown || this.cursors.up?.isDown;
-      const down = this.keyS.isDown || this.cursors.down?.isDown;
-      const left = this.keyA.isDown || this.cursors.left?.isDown;
-      const right = this.keyD.isDown || this.cursors.right?.isDown;
-
-      // If patrol is active, *follow server* (no prediction)
-      if (p.patrol && !(up || down || left || right)) {
-        this.myPred.x = Phaser.Math.Linear(this.myPred.x, p.x, 0.18);
-        this.myPred.y = Phaser.Math.Linear(this.myPred.y, p.y, 0.18);
+      if (serverMe.patrol && !(up || down || left || right)) {
+        this.myPred.x = Phaser.Math.Linear(this.myPred.x, serverMe.x, 0.18);
+        this.myPred.y = Phaser.Math.Linear(this.myPred.y, serverMe.y, 0.18);
       } else {
-        // Predict locally from inputs
         let dx = 0,
           dy = 0;
         if (up) dy -= speed * dt;
         if (down) dy += speed * dt;
         if (left) dx -= speed * dt;
         if (right) dx += speed * dt;
-
-        // Normalize diagonal speed
         if (dx !== 0 && dy !== 0) {
           const inv = 1 / Math.sqrt(2);
           dx *= inv;
           dy *= inv;
         }
-
         this.myPred.x = clamp(this.myPred.x + dx, 0, this.world.w);
         this.myPred.y = clamp(this.myPred.y + dy, 0, this.world.h);
 
-        // Gentle reconciliation: drift toward authoritative server pos
-        const errX = p.x - this.myPred.x;
-        const errY = p.y - this.myPred.y;
-        const corr = 0.1; // lower = softer
+        // light safety drift toward server
+        const errX = serverMe.x - this.myPred.x;
+        const errY = serverMe.y - this.myPred.y;
+        const corr = 0.1;
         if (Math.abs(errX) + Math.abs(errY) > 0.2) {
           this.myPred.x += errX * corr;
           this.myPred.y += errY * corr;
@@ -198,17 +252,14 @@ export default class GameScene extends Phaser.Scene {
 
       meSprite.x = this.myPred.x;
       meSprite.y = this.myPred.y;
-      meSprite.setRotation(p.angle);
+      meSprite.setRotation(serverMe.angle);
       this.labels.get(this.meId!)?.setPosition(meSprite.x, meSprite.y - 24);
     }
 
-    // --- 3) Interpolate *remote* players as before ---
-    const players = (this.room?.state as any)?.players;
-    if (!players) return;
-
-    players.forEach((rp: PlayerSchema, id: string) => {
-      if (id === this.meId) return; // handled above
-
+    // 4) interpolate remotes
+    const players = (this.room.state as any).players;
+    players?.forEach((rp: PlayerSchema, id: string) => {
+      if (id === this.meId) return;
       const sprite = this.sprites.get(id);
       const label = this.labels.get(id);
       if (!sprite || !label) return;

@@ -9,6 +9,9 @@ export class Player extends Schema {
   @type("boolean") patrol: boolean = false;
   @type("number") tx: number = 0; // patrol target x
   @type("number") ty: number = 0; // patrol target y
+
+  // ⬇️ for client/server reconciliation
+  @type("number") lastProcessedInput: number = 0;
 }
 
 export class ArenaState extends Schema {
